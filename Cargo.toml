@@ -1,0 +1,17 @@
+[package]
+name = "aphelium"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The Engine: Vectorized data frames
+polars = { version = "0.50", features = ["lazy", "parquet", "diff", "rolling_window"] }
+# The Multi-threader: Parallel execution
+rayon = "1.10"
+# The API: Getting price data
+yahoo_finance_api = "4.1"
+tokio = { version = "1", features = ["full"] }
+# The Storage: Saving progress
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
