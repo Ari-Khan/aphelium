@@ -1,69 +1,78 @@
+mod data;
+mod generator;
+mod executor;
+
 use polars::prelude::*;
-use std::fs;
-use std::path::Path;
-use yahoo_finance_api as yahoo;
-use chrono::{DateTime, Utc};
+use std::fs::File;
+use tokio;
+
+struct StrategyRank {
+    params: generator::StrategyParams,
+    profit: f64,
+    sharpe: f64,
+    max_dd: f64,
+    trades: usize,
+    cagr: f64,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create necessary folders if they don't exist
-    fs::create_dir_all("data")?;
-    fs::create_dir_all("results")?;
+    let ticker = "SPY";
+    let path = "data/SPY.parquet";
 
-    // The list of tickers to harvest
-    let tickers = vec!["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "SPY", "QQQ", "DIA"];
+    data::harvest_max_history(ticker, path).await?;
+    let file = File::open(path)?;
+    let df = ParquetReader::new(file).finish()?;
+    
+    let space = generator::create_search_space(); 
+    eprintln!("Testing {} Portfolio Variations...", space.len());
 
-    println!("🚀 Aphelium Harvester Initialized...");
+    let mut leaderboard: Vec<StrategyRank> = Vec::new();
 
-    for ticker in tickers {
-        let file_path = format!("data/{}.parquet", ticker);
-
-        // PROGRESS CHECK: Skip if we already have this data
-        if Path::new(&file_path).exists() {
-            println!("⏩ Skipping {}: Data already in vault.", ticker);
-            continue;
-        }
-
-        println!("📥 Fetching data for {}...", ticker);
-        
-        match download_to_parquet(ticker, &file_path).await {
-            Ok(_) => println!("✅ Successfully saved {}.", ticker),
-            Err(e) => eprintln!("❌ Error downloading {}: {}", ticker, e),
+    for p in space {
+        if let Some((ret, sharpe, mdd, count, cagr)) = executor::evaluate(&df, &p) {
+            leaderboard.push(StrategyRank { 
+                params: p, 
+                profit: ret, 
+                sharpe, 
+                max_dd: mdd, 
+                trades: count, 
+                cagr 
+            });
         }
     }
 
-    println!("\n⭐ Harvest complete. All tickers are stored in /data.");
-    Ok(())
-}
+    leaderboard.sort_by(|a, b| b.cagr.partial_cmp(&a.cagr).unwrap_or(std::cmp::Ordering::Equal));
 
-async fn download_to_parquet(ticker: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = yahoo::YahooConnector::new()?;
-    
-    // Fetch max history (usually goes back to IPO or 1980s)
-    let response = provider.get_quote_range(ticker, "1d", "max").await?;
-    let quotes = response.quotes()?;
+    println!("{:<24} | {:<5} | {:<4} | {:<8} | {:<8} | {:<8} | {:<8} | {:<8} | {:<6}", 
+             "STRATEGY (Buy -> Sell)", "SLOTS", "EXIT", "TOTAL %", "ANNUAL %", "SHARPE", "CALMAR", "MAX DD", "TRADES");
+    println!("{}", "-".repeat(125));
 
-    // Map Yahoo data to vectors for Polars
-    let dates: Vec<i64> = quotes.iter().map(|q| q.timestamp as i64).collect();
-    let opens: Vec<f64> = quotes.iter().map(|q| q.open).collect();
-    let highs: Vec<f64> = quotes.iter().map(|q| q.high).collect();
-    let lows: Vec<f64> = quotes.iter().map(|q| q.low).collect();
-    let closes: Vec<f64> = quotes.iter().map(|q| q.close).collect();
-    let volumes: Vec<f64> = quotes.iter().map(|q| q.volume as f64).collect();
+    for s in leaderboard.iter().take(5000) {
+        let exit_str = if s.params.exit_days == 0 { 
+            "SIG".to_string() 
+        } else { 
+            format!("{}d", s.params.exit_days) 
+        };
+        
+        let calmar = if s.max_dd.abs() > 0.0001 { 
+            s.cagr / s.max_dd.abs() 
+        } else { 
+            0.0 
+        };
 
-    // Create the DataFrame
-    let mut df = df!(
-        "timestamp" => dates,
-        "open" => opens,
-        "high" => highs,
-        "low" => lows,
-        "close" => closes,
-        "volume" => volumes,
-    )?;
-
-    // Save to the Vault (Parquet)
-    let mut file = fs::File::create(path)?;
-    ParquetWriter::new(&mut file).finish(&mut df)?;
+        println!("B:{:>2}/{:>4.1}% -> S:{:>2}/{:>4.1}% | {:>5} | {:>4} | {:>7.1}% | {:>7.1}% | {:>8.2} | {:>8.2} | {:>7.1}% | {:>6}",
+            s.params.buy_lb, s.params.buy_thr * 100.0, 
+            s.params.sell_lb, s.params.sell_thr * 100.0,
+            s.params.max_slots,
+            exit_str,
+            s.profit * 100.0, 
+            s.cagr * 100.0,
+            s.sharpe, 
+            calmar, 
+            s.max_dd * 100.0, 
+            s.trades);
+    }
 
     Ok(())
 }
